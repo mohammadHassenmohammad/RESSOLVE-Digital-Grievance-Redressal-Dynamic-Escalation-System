@@ -90,7 +90,7 @@ const AuditLogs = () => {
       title: 'User/Officer',
       dataIndex: 'userId',
       key: 'userId',
-      render: (uid) => users.find(u => u.id === uid)?.name || uid || 'System',
+      render: (uid, record) => record.userName || users.find(u => u.id === uid)?.name || uid || 'System',
     },
     {
       title: 'Activity Details',

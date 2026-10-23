@@ -197,7 +197,29 @@ const Analytics = () => {
               <Option value="30days">Last 30 Days</Option>
               <Option value="90days">Last 90 Days</Option>
             </Select>
-            <Button type="primary" icon={<DownloadOutlined />}>Export Report</Button>
+            <Button
+              type="primary"
+              icon={<DownloadOutlined />}
+              onClick={() => {
+                const headers = ['Department', 'Total Grievances', 'Resolved Grievances', 'SLA Compliance %', 'Avg Resolution Days'];
+                const rows = deptPerformanceData.map(d => [
+                  `"${d.name}"`, d.complaints, d.resolved, `${d.SLA}%`, d.avgDays
+                ].join(','));
+                const csv = [headers.join(','), ...rows].join('\n');
+                const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = `department_analytics_${dayjs().format('YYYYMMDD_HHmm')}.csv`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(url);
+              }}
+              style={{ borderRadius: 8, fontWeight: 700 }}
+            >
+              Export Report
+            </Button>
           </Space>
         </Col>
       </Row>

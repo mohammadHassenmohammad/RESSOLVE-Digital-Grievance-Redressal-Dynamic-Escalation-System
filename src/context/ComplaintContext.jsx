@@ -1,345 +1,455 @@
-import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
 import {
-  collection, addDoc, updateDoc, doc, onSnapshot, query, orderBy,
-} from 'firebase/firestore';
-import { db } from '../utils/firebase';
+  getStoredComplaints,
+  saveStoredComplaints,
+  getStoredAuditLogs,
+  saveStoredAuditLogs,
+  getStoredNotifications,
+  saveStoredNotifications,
+} from '../utils/persistentStorage';
 import { useSystemData } from './SystemDataContext';
 import dayjs from 'dayjs';
 
 const ComplaintContext = createContext();
 
 export const ComplaintProvider = ({ children }) => {
-  const [complaints, setComplaints] = useState([]);
-  const [notifications, setNotifications] = useState([]);
-  const [auditLogs, setAuditLogs] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const { categories, workflows, users } = useSystemData();
+  const [complaints, setComplaints] = useState(() => getStoredComplaints());
+  const [auditLogs, setAuditLogs] = useState(() => getStoredAuditLogs());
+  const [notifications, setNotifications] = useState(() => getStoredNotifications());
+  const [loading, setLoading] = useState(false);
+  const { categories, workflows, users, departments } = useSystemData();
 
-  // Keep a stable ref so the SLA timer always sees current data
-  const complaintsRef = useRef([]);
-  const workflowsRef  = useRef([]);
-  const usersRef      = useRef([]);
+  const complaintsRef = useRef(complaints);
+  const workflowsRef = useRef(workflows);
+  const usersRef = useRef(users);
   complaintsRef.current = complaints;
-  workflowsRef.current  = workflows;
-  usersRef.current      = users;
+  workflowsRef.current = workflows;
+  usersRef.current = users;
 
-  // ── Firestore Listeners ────────────────────────────────────────────────
-  useEffect(() => {
-    const q = query(collection(db, 'complaints'), orderBy('createdAt', 'desc'));
-    return onSnapshot(q,
-      snap => { setComplaints(snap.docs.map(d => ({ id: d.id, ...d.data() }))); setLoading(false); },
-      err  => { console.error('Complaints listener:', err); setLoading(false); }
-    );
+  // React to storage updates from other tabs / components
+  const reloadFromStorage = useCallback(() => {
+    setComplaints(getStoredComplaints());
+    setAuditLogs(getStoredAuditLogs());
+    setNotifications(getStoredNotifications());
   }, []);
 
   useEffect(() => {
-    const q = query(collection(db, 'auditLogs'), orderBy('timestamp', 'desc'));
-    return onSnapshot(q,
-      snap => setAuditLogs(snap.docs.map(d => ({ id: d.id, ...d.data() }))),
-      err  => console.error('AuditLogs listener:', err)
-    );
-  }, []);
-
-  useEffect(() => {
-    const q = query(collection(db, 'notifications'), orderBy('timestamp', 'desc'));
-    return onSnapshot(q,
-      snap => setNotifications(snap.docs.map(d => ({ id: d.id, ...d.data() }))),
-      err  => console.error('Notifications listener:', err)
-    );
-  }, []);
-
-  // ── Auto SLA Escalation Engine ─────────────────────────────────────────
-  // Runs every 2 minutes. Finds active complaints past their SLA deadline
-  // that haven't been auto-escalated yet and escalates them one level.
-  useEffect(() => {
-    const runSlaCheck = async () => {
-      const now = dayjs();
-      const activeComplaints = complaintsRef.current.filter(c =>
-        !['Resolved', 'Closed', 'Rejected'].includes(c.status) &&
-        c.slaDeadline &&
-        now.isAfter(dayjs(c.slaDeadline)) &&
-        !c.slaAutoEscalated   // flag to prevent repeated auto-escalation
-      );
-
-      for (const complaint of activeComplaints) {
-        const workflow = workflowsRef.current.find(w => w.deptId === complaint.deptId);
-        if (!workflow) continue;
-
-        const currentIdx = complaint.escalationLevel - 1;
-
-        // Find the next officer in the workflow chain
-        let nextOfficer = null;
-        let newLevel = complaint.escalationLevel;
-        let escalationRemark = '';
-
-        if (currentIdx + 1 < workflow.levels.length) {
-          // Can still escalate within the workflow
-          const nextRole = workflow.levels[currentIdx + 1];
-          nextOfficer = usersRef.current.find(
-            u => u.roleId === nextRole && u.deptId === complaint.deptId && u.status !== 'inactive'
-          ) || usersRef.current.find(
-            u => u.roleId === nextRole && u.status !== 'inactive'
-          );
-          newLevel = complaint.escalationLevel + 1;
-          escalationRemark = `Auto-escalated to ${nextOfficer?.name || 'Higher Authority'} — SLA deadline breached`;
-        } else {
-          // Already at top level — mark as pending admin review
-          escalationRemark = 'SLA deadline breached at top escalation level — admin review required';
-        }
-
-        try {
-          await updateDoc(doc(db, 'complaints', complaint.id), {
-            escalationLevel: newLevel,
-            assignedOfficerId: nextOfficer?.id || complaint.assignedOfficerId,
-            status: 'Escalated',
-            updatedAt: now.toISOString(),
-            slaAutoEscalated: true,
-            timeline: [
-              ...complaint.timeline,
-              {
-                status: 'Escalated',
-                remark: escalationRemark,
-                timestamp: now.toISOString(),
-                auto: true,
-              },
-            ],
-          });
-
-          // Notify the newly assigned officer
-          if (nextOfficer) {
-            await addDoc(collection(db, 'notifications'), {
-              userId: nextOfficer.id,
-              message: `⚠️ SLA Breach: Complaint auto-escalated to you — "${complaint.title}"`,
-              timestamp: now.toISOString(),
-              read: false,
-            });
-          }
-
-          // Notify the original submitter
-          if (complaint.userId) {
-            await addDoc(collection(db, 'notifications'), {
-              userId: complaint.userId,
-              message: `Your complaint "${complaint.title}" was escalated due to SLA breach. We apologize for the delay.`,
-              timestamp: now.toISOString(),
-              read: false,
-            });
-          }
-
-          // Write audit log
-          await addDoc(collection(db, 'auditLogs'), {
-            action: 'SLA Escalation',
-            userId: 'system',
-            details: `Complaint #${complaint.id} auto-escalated to ${nextOfficer?.name || 'Higher Authority'} — SLA breach`,
-            timestamp: now.toISOString(),
-          });
-
-          console.log(`[SLA] Auto-escalated complaint #${complaint.id}`);
-        } catch (e) {
-          console.error('[SLA] Failed to auto-escalate:', complaint.id, e);
-        }
+    const handleUpdate = (e) => {
+      if (
+        !e?.detail?.key ||
+        e.detail.key === 'ressolve_complaints_v2' ||
+        e.detail.key === 'ressolve_audit_logs_v2' ||
+        e.detail.key === 'ressolve_notifications_v2'
+      ) {
+        reloadFromStorage();
       }
     };
-
-    // Run immediately on mount, then every 2 minutes
-    runSlaCheck();
-    const interval = setInterval(runSlaCheck, 2 * 60 * 1000);
-    return () => clearInterval(interval);
-  }, []); // Empty deps — uses refs so it always sees latest data
+    window.addEventListener('ressolve_storage_update', handleUpdate);
+    return () => window.removeEventListener('ressolve_storage_update', handleUpdate);
+  }, [reloadFromStorage]);
 
   // ── Helpers ─────────────────────────────────────────────────────────────
-  const addAuditLog = async (action, userId, details) => {
-    await addDoc(collection(db, 'auditLogs'), {
+  const addAuditLog = (action, userId, details, userName) => {
+    const newLog = {
+      id: `log-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       action,
       userId,
+      userName: userName || usersRef.current.find(u => u.id === userId)?.name || 'System',
       details,
       timestamp: new Date().toISOString(),
-    });
+    };
+    const current = getStoredAuditLogs();
+    const updated = [newLog, ...current];
+    setAuditLogs(updated);
+    saveStoredAuditLogs(updated);
   };
 
-  const addNotification = async (userId, message) => {
-    await addDoc(collection(db, 'notifications'), {
+  const addNotification = (userId, message, complaintId = null) => {
+    const newNotif = {
+      id: `notif-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       userId,
       message,
+      complaintId,
       timestamp: new Date().toISOString(),
       read: false,
-    });
+    };
+    const current = getStoredNotifications();
+    const updated = [newNotif, ...current];
+    setNotifications(updated);
+    saveStoredNotifications(updated);
   };
 
-  // ── Complaint Routing ────────────────────────────────────────────────────
-  const routeComplaint = (category) => {
-    if (!category) return null;
-    const deptId   = category.deptId;
-    const workflow = workflows.find(w => w.deptId === deptId);
-    if (!workflow) return null;
-
-    const firstRole = workflow.levels[0];
-
-    // 1st: dept-specific active officer
-    let officer = users.find(
-      u => u.roleId === firstRole && u.deptId === deptId && u.status !== 'inactive'
-    );
-    // 2nd fallback: any user with that role
-    if (!officer) {
-      officer = users.find(u => u.roleId === firstRole && u.status !== 'inactive');
-    }
-
-    return { officer, workflow };
+  const markAsRead = (notificationId) => {
+    const current = getStoredNotifications();
+    const updated = current.map(n => n.id === notificationId ? { ...n, read: true } : n);
+    setNotifications(updated);
+    saveStoredNotifications(updated);
   };
 
-  // ── Add Complaint ────────────────────────────────────────────────────────
-  const addComplaint = async (data) => {
-    const { title, description, categoryId, userId, priority = 'Medium', manualOfficerId } = data;
+  const markAllNotificationsRead = (userId) => {
+    const current = getStoredNotifications();
+    const updated = current.map(n => (n.userId === userId || !userId) ? { ...n, read: true } : n);
+    setNotifications(updated);
+    saveStoredNotifications(updated);
+  };
+
+  // ── Complaint Routing Engine ─────────────────────────────────────────────
+  const routeComplaint = (categoryId) => {
     const category = categories.find(c => c.id === categoryId);
-    const routing  = routeComplaint(category);
+    if (!category) return null;
+    const deptId = category.deptId;
+    const workflow = workflows.find(w => w.deptId === deptId);
+    if (!workflow || !workflow.levels || workflow.levels.length === 0) return null;
+
+    const firstRoleId = workflow.levels[0];
+    // Find active officer for this department & role
+    let officer = users.find(
+      u => u.roleId === firstRoleId && u.deptId === deptId && u.status !== 'inactive'
+    ) || users.find(
+      u => u.roleId === firstRoleId && u.status !== 'inactive'
+    );
+
+    return { officer, workflow, department: departments.find(d => d.id === deptId) };
+  };
+
+  // ── Add New Complaint ───────────────────────────────────────────────────
+  const addComplaint = async (data) => {
+    const {
+      title,
+      description,
+      categoryId,
+      userId,
+      citizenName,
+      priority = 'Medium',
+      manualOfficerId,
+      location = '',
+      attachments = [],
+    } = data;
+
+    const category = categories.find(c => c.id === categoryId);
+    const routing = routeComplaint(categoryId);
 
     const assignedOfficerId = manualOfficerId || routing?.officer?.id || null;
     let officerName = 'Pending Assignment';
     if (manualOfficerId) {
-      officerName = users.find(u => u.id === manualOfficerId)?.name || 'Chosen Officer';
+      officerName = users.find(u => u.id === manualOfficerId)?.name || 'Selected Officer';
     } else if (routing?.officer) {
       officerName = routing.officer.name;
     }
 
-    const slaDays = priority === 'Critical' ? 1 : priority === 'High' ? 2 : priority === 'Medium' ? 5 : 10;
+    // SLA calculation based on priority
+    const slaHours = priority === 'Critical' ? 24 : priority === 'High' ? 48 : priority === 'Medium' ? 96 : 168;
+    const now = dayjs();
+    const slaDeadline = now.add(slaHours, 'hour').toISOString();
+
+    const uniqueNum = Math.floor(1000 + Math.random() * 9000);
+    const newId = `GRV-2026-${uniqueNum}`;
 
     const newComplaint = {
+      id: newId,
       title,
       description,
       categoryId,
-      deptId: category?.deptId || null,
+      deptId: category?.deptId || routing?.workflow?.deptId || 'dept-1',
       priority,
       status: assignedOfficerId ? 'Assigned' : 'Pending',
       userId,
+      citizenName: citizenName || users.find(u => u.id === userId)?.name || 'Citizen',
       assignedOfficerId,
+      assignedOfficerName: officerName,
       escalationLevel: 1,
+      location: location || 'General Public Jurisdiction',
       slaAutoEscalated: false,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      slaDeadline: dayjs().add(slaDays, 'day').toISOString(),
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      slaDeadline,
+      attachments: attachments || [],
+      messages: [],
       timeline: [
-        { status: 'Submitted', timestamp: new Date().toISOString(), remark: 'Complaint registered successfully' },
+        {
+          status: 'Submitted',
+          timestamp: now.toISOString(),
+          remark: `Grievance officially submitted under Priority: ${priority}`,
+          user: citizenName || 'Citizen',
+        },
         ...(assignedOfficerId
-          ? [{ status: 'Assigned',  timestamp: new Date().toISOString(), remark: `Assigned to ${officerName}` }]
-          : [{ status: 'Pending',   timestamp: new Date().toISOString(), remark: 'No officer available — pending assignment' }]
+          ? [{
+              status: 'Assigned',
+              timestamp: now.add(1, 'minute').toISOString(),
+              remark: `Auto-routed to ${officerName} (Level 1 SLA: ${Math.round(slaHours / 24)} days)`,
+              user: 'Routing Engine',
+            }]
+          : [{
+              status: 'Pending',
+              timestamp: now.toISOString(),
+              remark: 'No active officer immediately available; queued for admin triage',
+              user: 'System',
+            }]
         ),
       ],
     };
 
-    const docRef = await addDoc(collection(db, 'complaints'), newComplaint);
-    addAuditLog('Complaint Created', userId, `Complaint #${docRef.id} submitted — routed to ${officerName}`);
+    const currentComplaints = getStoredComplaints();
+    const updated = [newComplaint, ...currentComplaints];
+    setComplaints(updated);
+    saveStoredComplaints(updated);
 
-    // Notify the assigned officer immediately
+    addAuditLog('Complaint Created', userId, `Complaint #${newId} filed — Routed to ${officerName}`);
+
+    // Notify assigned officer
     if (assignedOfficerId) {
       addNotification(
         assignedOfficerId,
-        `📋 New ${priority} priority complaint assigned to you: "${title}". SLA: ${slaDays} day${slaDays > 1 ? 's' : ''}.`
+        `📋 New ${priority} Priority grievance assigned to you: "${title}". SLA: ${Math.round(slaHours / 24)} days.`,
+        newId
       );
     }
 
-    return docRef.id;
+    return newId;
   };
 
-  // ── Update Complaint Status ───────────────────────────────────────────────
-  const updateComplaintStatus = async (complaintId, status, remark, officerId) => {
-    const complaint = complaints.find(c => c.id === complaintId);
+  // ── Update Complaint Status ──────────────────────────────────────────────
+  const updateComplaintStatus = async (complaintId, status, remark, officerId, resolutionProof = null) => {
+    const currentComplaints = getStoredComplaints();
+    const complaint = currentComplaints.find(c => c.id === complaintId);
     if (!complaint) return;
+
+    const actor = usersRef.current.find(u => u.id === officerId);
+    const actorName = actor?.name || 'Officer';
+    const now = new Date().toISOString();
 
     const updatedTimeline = [
       ...complaint.timeline,
-      { status, remark, timestamp: new Date().toISOString(), officerId },
+      {
+        status,
+        remark: remark || `Status transitioned to ${status}`,
+        timestamp: now,
+        user: actorName,
+        officerId,
+      },
     ];
 
-    await updateDoc(doc(db, 'complaints', complaintId), {
+    const updatedComplaint = {
+      ...complaint,
       status,
-      updatedAt: new Date().toISOString(),
+      updatedAt: now,
       timeline: updatedTimeline,
-      // Clear auto-escalation flag when manually resolved/acted upon
+      ...(resolutionProof ? { resolutionProof } : {}),
       ...(status === 'Resolved' || status === 'Closed' ? { slaAutoEscalated: true } : {}),
-    });
+    };
 
-    addAuditLog('Status Updated', officerId, `Complaint #${complaintId} → ${status}`);
+    const updated = currentComplaints.map(c => c.id === complaintId ? updatedComplaint : c);
+    setComplaints(updated);
+    saveStoredComplaints(updated);
 
-    // Notify the submitting citizen when their complaint changes status
-    if (complaint.userId && complaint.userId !== officerId) {
-      const citizenMsg = {
-        'In Progress': `Your complaint "${complaint.title}" is now being actively worked on.`,
-        Resolved:      `✅ Your complaint "${complaint.title}" has been marked as Resolved.`,
-        Escalated:     `Your complaint "${complaint.title}" has been escalated to a higher authority.`,
-        Closed:        `Your complaint "${complaint.title}" has been closed.`,
-        Rejected:      `Your complaint "${complaint.title}" was rejected. It has been escalated for review.`,
-      }[status];
+    addAuditLog('Status Updated', officerId, `Complaint #${complaintId} changed to ${status}: ${remark}`);
 
-      if (citizenMsg) {
-        addNotification(complaint.userId, citizenMsg);
+    // Notify citizen
+    if (complaint.userId) {
+      const messages = {
+        'In Progress': `⚙️ Your grievance "${complaint.title}" is now actively being worked on by ${actorName}.`,
+        Resolved: `✅ Your grievance "${complaint.title}" has been marked as Resolved. Please review and provide feedback.`,
+        Escalated: `🔺 Your grievance "${complaint.title}" has been escalated to higher departmental authority.`,
+        Closed: `🔒 Your grievance "${complaint.title}" has been verified and closed.`,
+      };
+      if (messages[status]) {
+        addNotification(complaint.userId, messages[status], complaintId);
       }
     }
   };
 
   // ── Manual Escalation ────────────────────────────────────────────────────
-  const escalateComplaint = async (complaintId) => {
-    const complaint = complaints.find(c => c.id === complaintId);
+  const escalateComplaint = async (complaintId, manualRemark = '') => {
+    const currentComplaints = getStoredComplaints();
+    const complaint = currentComplaints.find(c => c.id === complaintId);
     if (!complaint) return;
-    const workflow = workflows.find(w => w.deptId === complaint.deptId);
-    if (!workflow) return;
 
-    const currentIdx = complaint.escalationLevel - 1;
+    const workflow = workflowsRef.current.find(w => w.deptId === complaint.deptId);
+    const currentLevel = complaint.escalationLevel || 1;
+    let nextOfficer = null;
+    let newLevel = currentLevel;
+    let remark = manualRemark;
 
-    if (currentIdx + 1 < workflow.levels.length) {
-      const nextRole = workflow.levels[currentIdx + 1];
-
-      let nextOfficer = users.find(
-        u => u.roleId === nextRole && u.deptId === complaint.deptId && u.status !== 'inactive'
+    if (workflow && currentLevel < workflow.levels.length) {
+      const nextRoleId = workflow.levels[currentLevel];
+      nextOfficer = usersRef.current.find(
+        u => u.roleId === nextRoleId && u.deptId === complaint.deptId && u.status !== 'inactive'
+      ) || usersRef.current.find(
+        u => u.roleId === nextRoleId && u.status !== 'inactive'
       );
-      if (!nextOfficer) {
-        nextOfficer = users.find(u => u.roleId === nextRole && u.status !== 'inactive');
-      }
+      newLevel = currentLevel + 1;
+      remark = remark || `Manually escalated to Level ${newLevel} (${nextOfficer?.name || 'Higher Authority'})`;
+    } else {
+      remark = remark || `Escalated to Top Authority / State Oversight for urgent review`;
+    }
 
-      const remark = `Manually escalated to ${nextOfficer?.name || 'Higher Authority'}`;
-
-      await updateDoc(doc(db, 'complaints', complaintId), {
-        escalationLevel: complaint.escalationLevel + 1,
-        assignedOfficerId: nextOfficer?.id || complaint.assignedOfficerId,
-        status: 'Escalated',
-        updatedAt: new Date().toISOString(),
-        slaAutoEscalated: false, // Reset so it can be auto-escalated again if needed
-        timeline: [...complaint.timeline, {
+    const now = new Date().toISOString();
+    const updatedComplaint = {
+      ...complaint,
+      escalationLevel: newLevel,
+      assignedOfficerId: nextOfficer?.id || complaint.assignedOfficerId,
+      assignedOfficerName: nextOfficer?.name || complaint.assignedOfficerName,
+      status: 'Escalated',
+      updatedAt: now,
+      timeline: [
+        ...complaint.timeline,
+        {
           status: 'Escalated',
           remark,
-          timestamp: new Date().toISOString(),
-        }],
-      });
+          timestamp: now,
+          user: 'Manual Escalation',
+        },
+      ],
+    };
 
-      addAuditLog('Complaint Escalated', complaint.assignedOfficerId,
-        `Complaint #${complaintId} manually escalated to ${nextOfficer?.name || 'Higher Authority'}`);
+    const updated = currentComplaints.map(c => c.id === complaintId ? updatedComplaint : c);
+    setComplaints(updated);
+    saveStoredComplaints(updated);
 
-      if (nextOfficer) {
-        addNotification(nextOfficer.id, `🔺 Complaint escalated to you: "${complaint.title}"`);
-      }
+    addAuditLog('Complaint Escalated', complaint.assignedOfficerId, `Complaint #${complaintId} escalated to Level ${newLevel}`);
 
-      // Notify citizen
-      if (complaint.userId) {
-        addNotification(complaint.userId, `Your complaint "${complaint.title}" has been escalated to a senior officer.`);
-      }
-    } else {
-      // Already at the top — notify admin
-      await updateDoc(doc(db, 'complaints', complaintId), {
-        status: 'Escalated',
-        updatedAt: new Date().toISOString(),
-        timeline: [...complaint.timeline, {
-          status: 'Escalated',
-          remark: 'Escalated to top level — requires admin intervention',
-          timestamp: new Date().toISOString(),
-        }],
-      });
-      addAuditLog('Max Escalation Reached', complaint.assignedOfficerId,
-        `Complaint #${complaintId} reached maximum escalation level`);
+    if (nextOfficer) {
+      addNotification(nextOfficer.id, `🔺 Escalated Grievance Assigned: "${complaint.title}" requires your action.`, complaintId);
+    }
+    if (complaint.userId) {
+      addNotification(complaint.userId, `Your grievance "${complaint.title}" has been escalated to senior authority.`, complaintId);
     }
   };
 
-  // ── Mark Notification Read ─────────────────────────────────────────────
-  const markAsRead = async (notificationId) => {
-    await updateDoc(doc(db, 'notifications', notificationId), { read: true });
+  // ── Send Chat Message on Grievance ──────────────────────────────────────
+  const addComplaintMessage = async (complaintId, messageText, sender) => {
+    const currentComplaints = getStoredComplaints();
+    const complaint = currentComplaints.find(c => c.id === complaintId);
+    if (!complaint || !messageText.trim()) return;
+
+    const newMessage = {
+      id: `m-${Date.now()}`,
+      senderId: sender.id || sender.uid,
+      senderName: sender.name || 'User',
+      senderRole: sender.roleId === 'role-citizen' ? 'Citizen' : 'Officer',
+      text: messageText.trim(),
+      timestamp: new Date().toISOString(),
+    };
+
+    const updatedMessages = [...(complaint.messages || []), newMessage];
+    const updatedComplaint = {
+      ...complaint,
+      messages: updatedMessages,
+      updatedAt: new Date().toISOString(),
+    };
+
+    const updated = currentComplaints.map(c => c.id === complaintId ? updatedComplaint : c);
+    setComplaints(updated);
+    saveStoredComplaints(updated);
+
+    // Notify other party
+    if (sender.id === complaint.userId) {
+      if (complaint.assignedOfficerId) {
+        addNotification(complaint.assignedOfficerId, `💬 Citizen message on #${complaint.id}: "${messageText.slice(0, 50)}..."`, complaintId);
+      }
+    } else {
+      if (complaint.userId) {
+        addNotification(complaint.userId, `💬 Officer response on #${complaint.id}: "${messageText.slice(0, 50)}..."`, complaintId);
+      }
+    }
   };
+
+  // ── Citizen Satisfaction Rating ─────────────────────────────────────────
+  const rateComplaint = async (complaintId, rating, feedback) => {
+    const currentComplaints = getStoredComplaints();
+    const complaint = currentComplaints.find(c => c.id === complaintId);
+    if (!complaint) return;
+
+    const now = new Date().toISOString();
+    const updatedComplaint = {
+      ...complaint,
+      status: 'Closed',
+      rating,
+      feedback,
+      updatedAt: now,
+      timeline: [
+        ...complaint.timeline,
+        {
+          status: 'Closed',
+          remark: `Citizen closed grievance with ${rating} ★ rating. Feedback: "${feedback || 'No comments'}"`,
+          timestamp: now,
+          user: complaint.citizenName || 'Citizen',
+        },
+      ],
+    };
+
+    const updated = currentComplaints.map(c => c.id === complaintId ? updatedComplaint : c);
+    setComplaints(updated);
+    saveStoredComplaints(updated);
+
+    addAuditLog('Complaint Closed', complaint.userId, `Complaint #${complaintId} verified and rated ${rating}★ by citizen`);
+  };
+
+  // ── Auto SLA Escalation Engine ──────────────────────────────────────────
+  useEffect(() => {
+    const checkSlaBreaches = () => {
+      const now = dayjs();
+      const currentList = getStoredComplaints();
+      let hasChanges = false;
+
+      const updated = currentList.map(c => {
+        if (
+          !['Resolved', 'Closed', 'Rejected'].includes(c.status) &&
+          c.slaDeadline &&
+          now.isAfter(dayjs(c.slaDeadline)) &&
+          !c.slaAutoEscalated
+        ) {
+          hasChanges = true;
+          const workflow = workflowsRef.current.find(w => w.deptId === c.deptId);
+          const currentLevel = c.escalationLevel || 1;
+          let nextOfficer = null;
+          let newLevel = currentLevel;
+
+          if (workflow && currentLevel < workflow.levels.length) {
+            const nextRoleId = workflow.levels[currentLevel];
+            nextOfficer = usersRef.current.find(
+              u => u.roleId === nextRoleId && u.deptId === c.deptId && u.status !== 'inactive'
+            ) || usersRef.current.find(
+              u => u.roleId === nextRoleId && u.status !== 'inactive'
+            );
+            newLevel = currentLevel + 1;
+          }
+
+          const remark = `SLA Threshold Breached! Auto-escalated to Level ${newLevel} (${nextOfficer?.name || 'Higher Authority'})`;
+
+          return {
+            ...c,
+            status: 'Escalated',
+            escalationLevel: newLevel,
+            assignedOfficerId: nextOfficer?.id || c.assignedOfficerId,
+            assignedOfficerName: nextOfficer?.name || c.assignedOfficerName,
+            slaAutoEscalated: true,
+            updatedAt: now.toISOString(),
+            timeline: [
+              ...c.timeline,
+              {
+                status: 'Escalated',
+                remark,
+                timestamp: now.toISOString(),
+                user: 'Auto SLA Engine',
+                auto: true,
+              },
+            ],
+          };
+        }
+        return c;
+      });
+
+      if (hasChanges) {
+        setComplaints(updated);
+        saveStoredComplaints(updated);
+      }
+    };
+
+    checkSlaBreaches();
+    const interval = setInterval(checkSlaBreaches, 60 * 1000);
+    return () => clearInterval(interval);
+  }, []);
 
   return (
     <ComplaintContext.Provider value={{
@@ -347,9 +457,13 @@ export const ComplaintProvider = ({ children }) => {
       addComplaint,
       updateComplaintStatus,
       escalateComplaint,
+      addComplaintMessage,
+      rateComplaint,
       auditLogs,
       notifications,
       markAsRead,
+      markAllNotificationsRead,
+      addAuditLog,
       addNotification,
       loading,
     }}>

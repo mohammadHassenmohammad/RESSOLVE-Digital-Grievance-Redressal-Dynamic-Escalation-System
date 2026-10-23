@@ -1,51 +1,44 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import {
   Card, Table, Tag, Typography, Button, Space, Modal, Form,
-  Input, Select, Avatar, App, Popconfirm, Badge, Divider, Row, Col, Statistic
+  Input, Select, Avatar, App, Popconfirm, Badge, Divider, Row, Col, Statistic, Tooltip,
 } from 'antd';
 import {
   UserAddOutlined, EditOutlined, StopOutlined, SearchOutlined,
-  ReloadOutlined, TeamOutlined, UserOutlined, CrownOutlined, SafetyOutlined, DeleteOutlined
+  ReloadOutlined, TeamOutlined, UserOutlined, CrownOutlined, SafetyOutlined, DeleteOutlined,
+  CheckCircleOutlined,
 } from '@ant-design/icons';
-import { collection, getDocs, doc, updateDoc, setDoc, serverTimestamp, deleteDoc, addDoc } from 'firebase/firestore';
-import { createUserWithEmailAndPassword, signOut } from 'firebase/auth';
-import { db, secondaryAuth } from '../../utils/firebase';
 import { useSystemData } from '../../context/SystemDataContext';
+import { useComplaints } from '../../context/ComplaintContext';
 import { useAuth } from '../../context/AuthContext';
 import dayjs from 'dayjs';
 
-const { Title, Text } = Typography;
+const { Title, Text, Paragraph } = Typography;
 const { Option } = Select;
 
 const UserManagement = () => {
-  const { message, modal } = App.useApp();
+  const { message } = App.useApp();
   const { user: adminUser } = useAuth();
-  const [users, setUsers] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const { users, roles, departments, saveUser, deleteUser, toggleUserStatus } = useSystemData();
+  const { addAuditLog } = useComplaints();
+
   const [searchText, setSearchText] = useState('');
+  const [deptFilter, setDeptFilter] = useState('ALL');
+  const [roleFilter, setRoleFilter] = useState('ALL');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingUser, setEditingUser] = useState(null);
   const [saving, setSaving] = useState(false);
   const [form] = Form.useForm();
-  const { roles, departments } = useSystemData();
 
-  const fetchUsers = async () => {
-    setLoading(true);
-    try {
-      const snapshot = await getDocs(collection(db, 'users'));
-      setUsers(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
-    } catch (err) {
-      message.error('Failed to load users: ' + err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => { fetchUsers(); }, []);
-
-  const handleEditRole = (user) => {
-    setEditingUser(user);
-    form.setFieldsValue({ roleId: user.roleId, deptId: user.deptId, name: user.name });
+  const handleEditRole = (u) => {
+    setEditingUser(u);
+    form.setFieldsValue({
+      name: u.name,
+      email: u.email,
+      roleId: u.roleId,
+      deptId: u.deptId || undefined,
+      phone: u.phone || '',
+    });
     setIsModalOpen(true);
   };
 
@@ -59,42 +52,32 @@ const UserManagement = () => {
     setSaving(true);
     try {
       if (editingUser) {
-        // Update existing user
-        await updateDoc(doc(db, 'users', editingUser.id), {
+        await saveUser({
+          ...editingUser,
+          name: values.name,
           roleId: values.roleId,
           deptId: values.deptId || null,
-          name: values.name,
-          updatedAt: new Date().toISOString(),
+          phone: values.phone || '',
         });
-        await addDoc(collection(db, 'auditLogs'), {
-          action: 'User Updated',
-          userId: adminUser?.uid || 'admin',
-          details: `User "${values.name}" (${editingUser.email}) role changed to "${values.roleId}", department to "${values.deptId || 'None'}"`,
-          timestamp: new Date().toISOString(),
-        });
+        addAuditLog('User Updated', adminUser?.uid || 'admin', `Updated user "${values.name}" (${editingUser.email})`);
         message.success('User updated successfully!');
       } else {
-        // Create new user via Firebase Auth + Firestore using secondaryAuth
-        const cred = await createUserWithEmailAndPassword(secondaryAuth, values.email, values.password);
-        await setDoc(doc(db, 'users', cred.user.uid), {
+        const newId = `u-${Date.now()}`;
+        await saveUser({
+          id: newId,
           name: values.name,
           email: values.email,
+          password: values.password || 'Demo@123',
           roleId: values.roleId,
           deptId: values.deptId || null,
+          phone: values.phone || '',
           status: 'active',
           createdAt: new Date().toISOString(),
         });
-        await addDoc(collection(db, 'auditLogs'), {
-          action: 'User Created',
-          userId: adminUser?.uid || 'admin',
-          details: `New user "${values.name}" (${values.email}) created with role "${values.roleId}"`,
-          timestamp: new Date().toISOString(),
-        });
-        await signOut(secondaryAuth);
-        message.success('User created successfully!');
+        addAuditLog('User Created', adminUser?.uid || 'admin', `Created user account for "${values.name}" (${values.email})`);
+        message.success('New user account created successfully!');
       }
       setIsModalOpen(false);
-      fetchUsers();
     } catch (err) {
       message.error(err.message);
     } finally {
@@ -102,265 +85,288 @@ const UserManagement = () => {
     }
   };
 
-  const handleDeactivate = async (u) => {
-    try {
-      const newStatus = u.status === 'active' ? 'inactive' : 'active';
-      await updateDoc(doc(db, 'users', u.id), {
-        status: newStatus,
-      });
-      await addDoc(collection(db, 'auditLogs'), {
-        action: newStatus === 'active' ? 'User Activated' : 'User Deactivated',
-        userId: adminUser?.uid || 'admin',
-        details: `User "${u.name}" (${u.email}) status set to "${newStatus}"`,
-        timestamp: new Date().toISOString(),
-      });
-      message.success(`User ${newStatus === 'active' ? 'reactivated' : 'deactivated'}!`);
-      fetchUsers();
-    } catch (err) {
-      message.error(err.message);
-    }
+  const handleToggleStatus = async (u) => {
+    await toggleUserStatus(u.id);
+    const newStatus = u.status === 'active' ? 'inactive' : 'active';
+    addAuditLog(newStatus === 'active' ? 'User Activated' : 'User Deactivated', adminUser?.uid || 'admin', `User ${u.name} set to ${newStatus}`);
+    message.success(`User ${newStatus === 'active' ? 'reactivated' : 'deactivated'}!`);
   };
 
   const handleDelete = async (u) => {
-    try {
-      await deleteDoc(doc(db, 'users', u.id));
-      await addDoc(collection(db, 'auditLogs'), {
-        action: 'User Deleted',
-        userId: adminUser?.uid || 'admin',
-        details: `User "${u.name}" (${u.email}) permanently deleted from system`,
-        timestamp: new Date().toISOString(),
-      });
-      message.success('User deleted successfully!');
-      fetchUsers();
-    } catch (err) {
-      message.error('Failed to delete user: ' + err.message);
+    await deleteUser(u.id);
+    addAuditLog('User Deleted', adminUser?.uid || 'admin', `Permanently deleted user ${u.name} (${u.email})`);
+    message.success('User removed from system.');
+  };
+
+  // Filtering
+  const filteredUsers = users.filter(u => {
+    if (deptFilter !== 'ALL' && u.deptId !== deptFilter) return false;
+    if (roleFilter !== 'ALL' && u.roleId !== roleFilter) return false;
+
+    if (searchText.trim()) {
+      const q = searchText.toLowerCase();
+      const matchName = (u.name || '').toLowerCase().includes(q);
+      const matchEmail = (u.email || '').toLowerCase().includes(q);
+      if (!matchName && !matchEmail) return false;
     }
-  };
+    return true;
+  });
 
-  const filtered = users.filter(u =>
-    (u.name || '').toLowerCase().includes(searchText.toLowerCase()) ||
-    (u.email || '').toLowerCase().includes(searchText.toLowerCase())
-  );
-
-  const stats = {
-    total: users.length,
-    admins: users.filter(u => u.roleId === 'role-admin').length,
-    officers: users.filter(u => !['role-admin', 'role-citizen'].includes(u.roleId)).length,
-    citizens: users.filter(u => u.roleId === 'role-citizen').length,
-  };
-
-  const roleColors = {
-    'role-admin': 'gold',
-    'role-warden': 'blue',
-    'role-principal': 'purple',
-    'role-dean': 'magenta',
-    'role-vro': 'cyan',
-    'role-mro': 'geekblue',
-    'role-collector': 'volcano',
-    'role-citizen': 'default',
-  };
+  const totalOfficers = users.filter(u => u.roleId !== 'role-citizen' && u.roleId !== 'role-admin').length;
+  const totalCitizens = users.filter(u => u.roleId === 'role-citizen').length;
 
   const columns = [
     {
-      title: 'User',
-      key: 'user',
+      title: 'User Profile',
+      key: 'name',
       render: (_, u) => (
-        <Space>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <Avatar
-            src={`https://api.dicebear.com/7.x/avataaars/svg?seed=${u.name}`}
+            src={`https://api.dicebear.com/7.x/avataaars/svg?seed=${u.name || 'User'}`}
             size={40}
+            style={{ border: '2px solid #1677ff' }}
           />
           <div>
-            <div style={{ fontWeight: 600 }}>{u.name || '—'}</div>
-            <Text type="secondary" style={{ fontSize: 12 }}>{u.email}</Text>
+            <div style={{ fontWeight: 700, fontSize: 13, color: 'var(--text-main)' }}>{u.name}</div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{u.email}</div>
           </div>
-        </Space>
+        </div>
       ),
     },
     {
-      title: 'Role',
-      dataIndex: 'roleId',
-      key: 'roleId',
-      render: (r) => (
-        <Tag color={roleColors[r] || 'default'}>
-          {roles.find(role => role.id === r)?.name || r}
-        </Tag>
-      ),
-      filters: roles.map(r => ({ text: r.name, value: r.id })),
-      onFilter: (val, r) => r.roleId === val,
+      title: 'Assigned Role & Level',
+      key: 'role',
+      render: (_, u) => {
+        const r = roles.find(role => role.id === u.roleId);
+        return (
+          <Space>
+            <Tag color={r?.badgeColor || 'blue'} style={{ borderRadius: 12, fontWeight: 700, fontSize: 11 }}>
+              {r?.name || u.roleId}
+            </Tag>
+            {r && r.level > 0 && (
+              <Tag style={{ borderRadius: 10, fontSize: 10 }}>Level {r.level}</Tag>
+            )}
+          </Space>
+        );
+      },
     },
     {
-      title: 'Department',
-      dataIndex: 'deptId',
-      key: 'deptId',
-      render: (d) => departments.find(dept => dept.id === d)?.name || <Text type="secondary">—</Text>,
+      title: 'Department Jurisdiction',
+      key: 'dept',
+      render: (_, u) => {
+        const d = departments.find(dept => dept.id === u.deptId);
+        return d ? (
+          <Tag color="cyan" style={{ borderRadius: 10, fontSize: 11 }}>{d.name}</Tag>
+        ) : (
+          <Text type="secondary" style={{ fontSize: 11 }}>All Jurisdictions / Citizen</Text>
+        );
+      },
     },
     {
       title: 'Status',
       dataIndex: 'status',
       key: 'status',
-      render: (s) => (
+      render: (st) => (
         <Badge
-          status={s === 'inactive' ? 'error' : 'success'}
-          text={s === 'inactive' ? 'Inactive' : 'Active'}
+          status={st === 'inactive' ? 'error' : 'success'}
+          text={
+            <span style={{ fontSize: 12, fontWeight: 700, color: st === 'inactive' ? '#ff4d4f' : '#52c41a' }}>
+              {st === 'inactive' ? 'INACTIVE' : 'ACTIVE'}
+            </span>
+          }
         />
       ),
     },
     {
-      title: 'Joined',
+      title: 'Registered Date',
       dataIndex: 'createdAt',
       key: 'createdAt',
-      render: (t) => t ? dayjs(t).format('MMM D, YYYY') : '—',
-      sorter: (a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0),
+      render: (t) => <Text type="secondary" style={{ fontSize: 12 }}>{t ? dayjs(t).format('MMM D, YYYY') : '—'}</Text>,
     },
     {
       title: 'Actions',
       key: 'actions',
+      align: 'right',
       render: (_, u) => (
-        <Space>
-          <Button
-            size="small"
-            icon={<EditOutlined />}
-            onClick={() => handleEditRole(u)}
-          >
-            Edit
-          </Button>
-          <Popconfirm
-            title={`${u.status === 'active' ? 'Deactivate' : 'Reactivate'} this user?`}
-            onConfirm={() => handleDeactivate(u)}
-            okText="Yes"
-            cancelText="No"
-          >
+        <Space size={4}>
+          <Tooltip title="Edit Role & Details">
+            <Button size="small" icon={<EditOutlined />} onClick={() => handleEditRole(u)} />
+          </Tooltip>
+
+          <Tooltip title={u.status === 'active' ? 'Deactivate Account' : 'Reactivate Account'}>
             <Button
               size="small"
               icon={<StopOutlined />}
-              danger={u.status !== 'inactive'}
-              type={u.status === 'inactive' ? 'primary' : 'default'}
+              danger={u.status === 'active'}
+              onClick={() => handleToggleStatus(u)}
+            />
+          </Tooltip>
+
+          {u.roleId !== 'role-admin' && (
+            <Popconfirm
+              title="Delete User"
+              description={`Permanently remove ${u.name}?`}
+              onConfirm={() => handleDelete(u)}
+              okText="Delete"
+              cancelText="Cancel"
             >
-              {u.status === 'inactive' ? 'Reactivate' : 'Deactivate'}
-            </Button>
-          </Popconfirm>
-          <Popconfirm
-            title="Permanently delete this user? This cannot be undone."
-            onConfirm={() => handleDelete(u)}
-            okText="Yes"
-            cancelText="No"
-            okButtonProps={{ danger: true }}
-          >
-            <Button
-              size="small"
-              icon={<DeleteOutlined />}
-              danger
-              type="text"
-            >
-              Delete
-            </Button>
-          </Popconfirm>
+              <Button size="small" danger icon={<DeleteOutlined />} />
+            </Popconfirm>
+          )}
         </Space>
       ),
     },
   ];
 
   return (
-    <div className="fade-in">
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
+    <div className="fade-in" style={{ maxWidth: 1200, margin: '0 auto' }}>
+      {/* Title */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, flexWrap: 'wrap', gap: 16 }}>
         <div>
-          <Title level={2} style={{ margin: 0 }}>User Management</Title>
-          <Text type="secondary">Manage system users, roles, and permissions</Text>
+          <Title level={2} style={{ margin: 0, fontWeight: 800 }}>
+            User & Authority Management
+          </Title>
+          <Text type="secondary" style={{ fontSize: 14 }}>
+            Control user access roles, departmental jurisdictions, and active officer duty rosters.
+          </Text>
         </div>
-        <Space>
-          <Button icon={<ReloadOutlined />} onClick={fetchUsers} loading={loading}>Refresh</Button>
-          <Button type="primary" icon={<UserAddOutlined />} onClick={handleCreateUser}>
-            Add New User
-          </Button>
-        </Space>
+
+        <Button
+          type="primary"
+          icon={<UserAddOutlined />}
+          onClick={handleCreateUser}
+          style={{ borderRadius: 10, fontWeight: 700, height: 40 }}
+        >
+          Add New Officer / Citizen
+        </Button>
       </div>
 
-      {/* Stats Row */}
-      <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
-        {[
-          { title: 'Total Users', value: stats.total, icon: <TeamOutlined />, color: '#1677ff' },
-          { title: 'Admins', value: stats.admins, icon: <CrownOutlined />, color: '#faad14' },
-          { title: 'Officers', value: stats.officers, icon: <SafetyOutlined />, color: '#52c41a' },
-          { title: 'Citizens', value: stats.citizens, icon: <UserOutlined />, color: '#722ed1' },
-        ].map((s, i) => (
-          <Col xs={12} lg={6} key={i}>
-            <Card>
-              <Statistic
-                title={s.title}
-                value={s.value}
-                prefix={<span style={{ color: s.color }}>{s.icon}</span>}
-                valueStyle={{ color: s.color }}
-              />
-            </Card>
-          </Col>
-        ))}
+      {/* Overview Stat Cards */}
+      <Row gutter={[16, 16]} style={{ marginBottom: 20 }}>
+        <Col xs={12} sm={8}>
+          <Card size="small" style={{ borderRadius: 14, boxShadow: 'var(--shadow-sm)' }}>
+            <Statistic title="Total System Accounts" value={users.length} prefix={<TeamOutlined style={{ color: '#1677ff' }} />} />
+          </Card>
+        </Col>
+        <Col xs={12} sm={8}>
+          <Card size="small" style={{ borderRadius: 14, boxShadow: 'var(--shadow-sm)' }}>
+            <Statistic title="Active Department Officers" value={totalOfficers} prefix={<SafetyOutlined style={{ color: '#722ed1' }} />} />
+          </Card>
+        </Col>
+        <Col xs={12} sm={8}>
+          <Card size="small" style={{ borderRadius: 14, boxShadow: 'var(--shadow-sm)' }}>
+            <Statistic title="Registered Citizens" value={totalCitizens} prefix={<UserOutlined style={{ color: '#52c41a' }} />} />
+          </Card>
+        </Col>
       </Row>
 
-      <Card>
-        <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <Input
-            prefix={<SearchOutlined />}
-            placeholder="Search by name or email..."
-            style={{ width: 300 }}
-            value={searchText}
-            onChange={e => setSearchText(e.target.value)}
-            allowClear
-          />
-          <Text type="secondary">{filtered.length} users found</Text>
-        </div>
-        <Table
-          columns={columns}
-          dataSource={filtered}
-          rowKey="id"
-          loading={loading}
-          pagination={{ pageSize: 10 }}
-        />
-      </Card>
+      {/* Main Table Card */}
+      <Card
+        bordered={false}
+        style={{ borderRadius: 16, boxShadow: 'var(--shadow-sm)' }}
+        title={
+          <Space wrap size={12}>
+            <Input
+              prefix={<SearchOutlined style={{ color: 'var(--text-muted)' }} />}
+              placeholder="Search by name or email..."
+              value={searchText}
+              onChange={e => setSearchText(e.target.value)}
+              allowClear
+              style={{ width: 240, borderRadius: 10 }}
+            />
 
-      {/* Create / Edit Modal */}
-      <Modal
-        title={editingUser ? 'Edit User' : 'Create New User'}
-        open={isModalOpen}
-        onCancel={() => setIsModalOpen(false)}
-        footer={null}
-        width={480}
-      >
-        <Form form={form} layout="vertical" onFinish={handleSave} style={{ marginTop: 16 }}>
-          <Form.Item name="name" label="Full Name" rules={[{ required: true }]}>
-            <Input placeholder="e.g. John Smith" />
-          </Form.Item>
-          {!editingUser && (
-            <>
-              <Form.Item name="email" label="Email" rules={[{ required: true, type: 'email' }]}>
-                <Input placeholder="user@example.com" />
-              </Form.Item>
-              <Form.Item name="password" label="Password" rules={[{ required: true, min: 6 }]}>
-                <Input.Password placeholder="Min. 6 characters" />
-              </Form.Item>
-            </>
-          )}
-          <Form.Item name="roleId" label="Role" rules={[{ required: true }]}>
-            <Select placeholder="Select a role">
+            <Select value={deptFilter} onChange={setDeptFilter} style={{ width: 200 }}>
+              <Option value="ALL">All Departments</Option>
+              {departments.map(d => (
+                <Option key={d.id} value={d.id}>{d.name}</Option>
+              ))}
+            </Select>
+
+            <Select value={roleFilter} onChange={setRoleFilter} style={{ width: 180 }}>
+              <Option value="ALL">All Roles</Option>
               {roles.map(r => (
                 <Option key={r.id} value={r.id}>{r.name}</Option>
               ))}
             </Select>
+          </Space>
+        }
+      >
+        <Table
+          columns={columns}
+          dataSource={filteredUsers}
+          rowKey="id"
+          pagination={{ pageSize: 8, showSizeChanger: true }}
+        />
+      </Card>
+
+      {/* Add / Edit User Modal */}
+      <Modal
+        title={<span>{editingUser ? '✏️ Edit User Authority & Role' : '➕ Register New Officer or User'}</span>}
+        open={isModalOpen}
+        onCancel={() => setIsModalOpen(false)}
+        onOk={() => form.submit()}
+        confirmLoading={saving}
+        centered
+      >
+        <Form form={form} layout="vertical" onFinish={handleSave} style={{ padding: '12px 0' }}>
+          <Form.Item
+            name="name"
+            label="Full Name"
+            rules={[{ required: true, message: 'Please enter name' }]}
+          >
+            <Input placeholder="e.g., Dr. Alice Smith" />
           </Form.Item>
-          <Form.Item name="deptId" label="Department">
-            <Select placeholder="Select a department (optional)" allowClear>
+
+          <Form.Item
+            name="email"
+            label="Email Address"
+            rules={[{ required: true, type: 'email', message: 'Valid email required' }]}
+          >
+            <Input placeholder="e.g., alice@domain.com" disabled={!!editingUser} />
+          </Form.Item>
+
+          {!editingUser && (
+            <Form.Item
+              name="password"
+              label="Temporary Password"
+              initialValue="Demo@123"
+              rules={[{ required: true, min: 6 }]}
+            >
+              <Input.Password />
+            </Form.Item>
+          )}
+
+          <Form.Item
+            name="roleId"
+            label="Authority Role"
+            rules={[{ required: true, message: 'Select role' }]}
+          >
+            <Select placeholder="Select role">
+              {roles.map(r => (
+                <Option key={r.id} value={r.id}>
+                  {r.name} (Level {r.level})
+                </Option>
+              ))}
+            </Select>
+          </Form.Item>
+
+          <Form.Item
+            name="deptId"
+            label="Department Jurisdiction (Leave blank for Citizen or Admin)"
+          >
+            <Select placeholder="Optional: Select department" allowClear>
               {departments.map(d => (
                 <Option key={d.id} value={d.id}>{d.name}</Option>
               ))}
             </Select>
           </Form.Item>
-          <Divider />
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-            <Button onClick={() => setIsModalOpen(false)}>Cancel</Button>
-            <Button type="primary" htmlType="submit" loading={saving}>
-              {editingUser ? 'Save Changes' : 'Create User'}
-            </Button>
-          </div>
+
+          <Form.Item
+            name="phone"
+            label="Contact Phone Number"
+          >
+            <Input placeholder="e.g., +91 98765 43210" />
+          </Form.Item>
         </Form>
       </Modal>
     </div>
