@@ -1,7 +1,9 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "ressolve-grievance-system",
+  "name": "ressolve-digital-grievance-redressal-dynamic-escalation-sy",
   "compatibility_date": "2026-10-19",
+  "preview_urls": false,
+  "workers_dev": true,
   "observability": {
     "enabled": true
   },
